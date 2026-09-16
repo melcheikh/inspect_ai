@@ -1226,12 +1226,18 @@ def _score_answer_worker(
         )
         # If the primary answer was opaque text that didn't match (a prose
         # wrapper such as "42 because ..."), fall back to an expression-valued
-        # candidate — the bare last line / last number — that the text masked.
         if not correct and answer.expression is None:
-            fallback = _matching_expression_candidate(candidates, parsed_targets, sympy)
-            if fallback is not None:
-                correct = True
-                answer = fallback
+            try:
+                fallback = _matching_expression_candidate(
+                    candidates, parsed_targets, sympy
+                )
+                if fallback is not None:
+                    correct = True
+                    answer = fallback
+            except _MathLimitError as ex:
+                return _WorkerScore("answer_limit", None, str(ex))
+            except _MathParseError as ex:
+                return _WorkerScore("answer_parse_error", None, str(ex))
         return _WorkerScore(
             "correct" if correct else "incorrect",
             answer.source[:_MAX_CANDIDATE_CHARS],

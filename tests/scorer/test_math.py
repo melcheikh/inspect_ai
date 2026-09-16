@@ -976,3 +976,95 @@ def test_worker_context_resets_across_event_loops(
 
     anyio.run(run_once)
     anyio.run(run_once)
+
+
+@pytest.mark.parametrize(
+    "completion,expected_status",
+    [
+        (
+            (
+                "We analyse the domain of the function.\n"
+                "Final answer: every point where the function is continuous\n"
+                "the set is open (0, 1)"
+            ),
+            "answer_parse_error",
+        ),
+        (
+            (
+                "To find the determinant we expand along the first row.\n"
+                "Final answer: the matrix is singular, so no inverse exists\n"
+                r"\det A = 0"
+            ),
+            "answer_limit",
+        ),
+        (
+            (
+                "The answer is: a repeating decimal that never terminates\n"
+                "0." + "3" * 300
+            ),
+            "answer_limit",
+        ),
+    ],
+    ids=[
+        "code_shaped_candidate",
+        "eager_operation_candidate",
+        "oversized_literal_candidate",
+    ],
+)
+def test_fallback_over_limit_or_code_shaped_candidate_scores_incorrect(
+    completion: str, expected_status: str
+) -> None:
+    score = _score_answer(completion, ("42",))
+    assert score.status == expected_status
+
+
+@pytest.mark.anyio
+async def test_fallback_exception_does_not_escape_scorer() -> None:
+    completion = (
+        "We analyse the domain of the function.\n"
+        "Final answer: every point where the function is continuous\n"
+        "the set is open (0, 1)"
+    )
+    scorer = math()
+    score = await scorer(
+        simple_task_state(model_output=completion),
+        Target(["42"]),
+    )
+    assert score is not None
+    assert score.value == INCORRECT
+    assert score.reason == "invalid_response_format"
+    assert score.metadata is not None
+    assert score.metadata.get("math_scorer_status") == "answer_parse_error"
+
+
+def test_fallback_error_preserves_accuracy_denominator() -> None:
+    from inspect_ai.dataset import MemoryDataset
+
+    bad_completion = (
+        "We analyse the domain of the function.\n"
+        "Final answer: every point where the function is continuous\n"
+        "the set is open (0, 1)"
+    )
+    task = Task(
+        dataset=MemoryDataset(
+            [
+                Sample(input="q1", target="42"),
+                Sample(input="q2", target="42"),
+            ]
+        ),
+        solver=[generate()],
+        scorer=math(),
+    )
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            ModelOutput.from_content("mockllm/model", "42"),
+            ModelOutput.from_content("mockllm/model", bad_completion),
+        ],
+    )
+    [log] = eval(task, model=model, fail_on_error=False, display="none")
+    assert log.status == "success"
+    assert log.samples is not None
+    assert len(log.samples) == 2
+    assert log.results is not None
+    assert log.results.scores[0].metrics["accuracy"].value == pytest.approx(0.5)
