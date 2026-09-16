@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import (
@@ -64,6 +65,40 @@ is also legal; the detail behind a coarse value belongs in `explanation`.
 """
 
 
+MetricReason = Literal[
+    "empty_subpopulation",  # subset selected by metric is empty
+    "insufficient_pairs",  # not enough data points or pairs to compute statistic
+    "zero_variance",  # statistic undefined due to zero denominator variance
+    "multiple_attempts",  # metric expects single attempt per sample
+    "empty_dataset",  # zero samples evaluated
+]
+"""Standard machine-readable reasons for undefined metrics."""
+
+
+@dataclass(frozen=True)
+class MetricContext:
+    """Task and execution context available to metrics during calculation."""
+
+    total_samples: int | None = None
+    """Total planned samples in the task dataset."""
+
+    completed_samples: int | None = None
+    """Number of samples successfully completed."""
+
+    epochs: int | None = None
+    """Number of epochs configured for the task."""
+
+
+_CURRENT_METRIC_CONTEXT: ContextVar[MetricContext | None] = ContextVar(
+    "_CURRENT_METRIC_CONTEXT", default=None
+)
+
+
+def get_metric_context() -> MetricContext | None:
+    """Retrieve the current MetricContext if available."""
+    return _CURRENT_METRIC_CONTEXT.get()
+
+
 Value = Union[
     str | int | float | bool,
     Sequence[str | int | float | bool],
@@ -74,6 +109,49 @@ Value = Union[
 Use the methods of `Score` to easily treat
 the `Value` as a simple scalar of various types.
 """
+
+
+@dataclass
+class MetricResult:
+    """Result returned by a metric.
+
+    Allows metrics to report their own effective denominator (n),
+    reference population size (of), machine-readable reason when
+    undefined (reason), and optional custom metadata.
+    """
+
+    value: Value
+    """Metric value (scalar, sequence, or mapping)."""
+
+    n: int | None = None
+    """Effective denominator or sample count used by this metric."""
+
+    of: int | None = None
+    """Reference population or total available units for this metric."""
+
+    reason: MetricReason | str | None = None
+    """Machine-readable reason if the metric value is undefined (NaN)."""
+
+    metadata: dict[str, Any] | None = None
+    """Additional metadata associated with this metric result."""
+
+    @classmethod
+    def undefined(
+        cls,
+        reason: MetricReason | str,
+        n: int = 0,
+        of: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "MetricResult":
+        """Construct an undefined (NaN) metric result with a machine-readable reason."""
+        return cls(
+            value=float("nan"),
+            n=n,
+            of=of,
+            reason=reason,
+            metadata=metadata,
+        )
+
 
 UNCHANGED: Literal["UNCHANGED"] = "UNCHANGED"
 """Sentinel value to indicate an unchanged field in score edits."""
@@ -347,14 +425,14 @@ class MetricDeprecated(Protocol):
 
 @runtime_checkable
 class MetricProtocol(Protocol):
-    def __call__(self, scores: list[SampleScore]) -> Value:
+    def __call__(self, scores: list[SampleScore]) -> Value | MetricResult:
         r"""Compute a metric on a list of scores.
 
         Args:
           scores: List of scores.
 
         Returns:
-          Metric value
+          Metric value or MetricResult
 
         Examples:
           ```python

@@ -794,6 +794,15 @@ class EvalMetric(BaseModel):
     metadata: dict[str, Any] | None = Field(default=None)
     """Additional metadata associated with metric."""
 
+    n: int | None = Field(default=None)
+    """Effective denominator or sample count used by this metric (optional)."""
+
+    of: int | None = Field(default=None)
+    """Reference population or denominator available to this metric (optional)."""
+
+    reason: str | None = Field(default=None)
+    """Machine-readable reason for undefined metric value (optional)."""
+
 
 class EvalScore(BaseModel):
     """Score for evaluation task."""

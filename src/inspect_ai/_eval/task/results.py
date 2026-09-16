@@ -27,8 +27,11 @@ from inspect_ai.log._headline import headline_metric_ref, resolve_headline_metri
 from inspect_ai.log._log import EvalSampleReductions
 from inspect_ai.scorer import Metric, Score, Scorer
 from inspect_ai.scorer._metric import (
+    _CURRENT_METRIC_CONTEXT,
+    MetricContext,
     MetricDeprecated,
     MetricProtocol,
+    MetricResult,
     MetricScores,
     SampleScore,
     Value,
@@ -168,12 +171,19 @@ def eval_results(
                 score[scorer_name] for score in scores if scorer_name in score
             ]
 
+            context = MetricContext(
+                total_samples=samples,
+                completed_samples=(
+                    completed_samples if completed_samples is not None else len(scores)
+                ),
+            )
             eval_scores, reductions = compute_eval_scores_for_views(
                 resolved_scores,
                 scorer_info.metrics,
                 scorer_name,
                 scorer_info,
                 reducers,
+                context=context,
             )
             result_scores.extend(eval_scores)
             sample_reductions.extend(reductions)
@@ -195,6 +205,7 @@ def compute_eval_scores_for_views(
     scorer_name: str,
     scorer_info: ScorerInfo,
     reducers: ScoreReducer | list[ScoreReducer] | None,
+    context: MetricContext | None = None,
 ) -> tuple[list[EvalScore], list[EvalSampleReductions]]:
     result_scores: list[EvalScore] = []
     sample_reductions: list[EvalSampleReductions] = []
@@ -207,7 +218,9 @@ def compute_eval_scores_for_views(
                 'Configure an epochs reducer or use scores="auto"/"unreduced".'
             )
         result_scores.extend(
-            compute_eval_scores(scores, metrics, scorer_name, scorer_info, None)
+            compute_eval_scores(
+                scores, metrics, scorer_name, scorer_info, None, context=context
+            )
         )
         return result_scores, sample_reductions
 
@@ -235,13 +248,19 @@ def compute_eval_scores_for_views(
                     scorer_name,
                     scorer_info,
                     reducer_display_nm,
+                    context=context,
                 )
             )
 
     if unreduced_metrics is not None:
         result_scores.extend(
             compute_eval_scores(
-                scores, unreduced_metrics, scorer_name, scorer_info, None
+                scores,
+                unreduced_metrics,
+                scorer_name,
+                scorer_info,
+                None,
+                context=context,
             )
         )
 
@@ -254,6 +273,7 @@ def compute_eval_scores(
     scorer_name: str,
     scorer_info: ScorerInfo,
     reducer_display_nm: str | None = None,
+    context: MetricContext | None = None,
 ) -> list[EvalScore]:
     result_scores: list[EvalScore] = []
     # Compute metrics for this scorer
@@ -271,6 +291,7 @@ def compute_eval_scores(
                 sample_scores=scores,
                 metrics=simple_metrics,
                 reducer_name=reducer_display_nm,
+                context=context,
             )
         )
         for dict_metric in dict_metrics:
@@ -281,6 +302,7 @@ def compute_eval_scores(
                     sample_scores=scores,
                     metrics=dict_metric,
                     reducer_name=reducer_display_nm,
+                    context=context,
                 )
             )
     else:
@@ -399,6 +421,7 @@ def scorer_for_metrics(
     sample_scores: list[SampleScore],
     metrics: list[Metric],
     reducer_name: str | None = None,
+    context: MetricContext | None = None,
 ) -> list[EvalScore]:
     results: list[EvalScore] = []
 
@@ -427,44 +450,106 @@ def scorer_for_metrics(
         params = registry_params(metric)
         # process metric values
         if len(sample_scores_with_values) > 0:
-            metric_value = call_metric(metric, sample_scores_with_values)
+            metric_value = call_metric(
+                metric, sample_scores_with_values, context=context
+            )
         else:
-            metric_value = empty_metric_value(metric)
+            metric_value = empty_metric_value(metric, context=context)
         base_metric_name = registry_log_name(metric)
+
+        metric_res: MetricResult | None = (
+            metric_value if isinstance(metric_value, MetricResult) else None
+        )
+        raw_value = metric_res.value if metric_res is not None else metric_value
+        res_n = metric_res.n if metric_res is not None else None
+        res_of = metric_res.of if metric_res is not None else None
+        res_reason = metric_res.reason if metric_res is not None else None
+        res_metadata = metric_res.metadata if metric_res is not None else None
 
         # If the metric value is a dictionary, turn each of the entries
         # in the dictionary into a result
-        if isinstance(metric_value, Mapping):
-            for metric_key, value in metric_value.items():
+        if isinstance(raw_value, Mapping):
+            for metric_key, value in raw_value.items():
                 if value is not None:
                     name = metrics_unique_key(metric_key, list(list_metrics.keys()))
+                    if isinstance(value, MetricResult):
+                        item_val = float(cast(Any, value.value))
+                        item_n = value.n if value.n is not None else res_n
+                        item_of = value.of if value.of is not None else res_of
+                        item_reason = (
+                            value.reason if value.reason is not None else res_reason
+                        )
+                        item_metadata = (
+                            value.metadata
+                            if value.metadata is not None
+                            else res_metadata
+                        )
+                    else:
+                        item_val = float(cast(Any, value))
+                        item_n = res_n
+                        item_of = res_of
+                        item_reason = res_reason
+                        item_metadata = res_metadata
                     list_metrics[name] = EvalMetric(
                         name=metric_key,
                         group=group,
-                        value=float(value),
+                        value=item_val,
                         params=params,
+                        metadata=item_metadata,
+                        n=item_n,
+                        of=item_of,
+                        reason=item_reason,
                     )
 
         # If the metric value is a list, turn each element in the list
         # into a result
-        elif isinstance(metric_value, Sequence) and not isinstance(
-            metric_value, str | bytes
-        ):
-            for index, value in enumerate(metric_value):
+        elif isinstance(raw_value, Sequence) and not isinstance(raw_value, str | bytes):
+            for index, value in enumerate(raw_value):
                 if value is not None:
                     count = str(index + 1)
                     name = metrics_unique_key(
                         with_suffix(key, count), list(list_metrics.keys())
                     )
+                    if isinstance(value, MetricResult):
+                        item_val = float(cast(Any, value.value))
+                        item_n = value.n if value.n is not None else res_n
+                        item_of = value.of if value.of is not None else res_of
+                        item_reason = (
+                            value.reason if value.reason is not None else res_reason
+                        )
+                        item_metadata = (
+                            value.metadata
+                            if value.metadata is not None
+                            else res_metadata
+                        )
+                    else:
+                        item_val = float(cast(Any, value))
+                        item_n = res_n
+                        item_of = res_of
+                        item_reason = res_reason
+                        item_metadata = res_metadata
 
                     list_metrics[name] = EvalMetric(
-                        name=count, group=group, value=float(value), params=params
+                        name=count,
+                        group=group,
+                        value=item_val,
+                        params=params,
+                        metadata=item_metadata,
+                        n=item_n,
+                        of=item_of,
+                        reason=item_reason,
                     )
 
         # the metric is a float, str, or int
         else:
             list_metrics[key] = EvalMetric(
-                name=base_metric_name, value=float(metric_value), params=params
+                name=base_metric_name,
+                value=float(cast(Any, raw_value)),
+                params=params,
+                metadata=res_metadata,
+                n=res_n,
+                of=res_of,
+                reason=res_reason,
             )
 
     # build results
@@ -491,6 +576,7 @@ def scorers_from_metric_dict(
     sample_scores: list[SampleScore],
     metrics: dict[str, list[Metric]],
     reducer_name: str | None = None,
+    context: MetricContext | None = None,
 ) -> list[EvalScore]:
     results: list[EvalScore] = []
 
@@ -549,33 +635,91 @@ def scorers_from_metric_dict(
             # compute the metric value
             metric_name = registry_log_name(target_metric)
             metric_params = registry_params(target_metric)
+            metric_val: Value | MetricResult
             if len(key_scores) > 0:
-                value = call_metric(target_metric, key_scores)
+                metric_val = call_metric(target_metric, key_scores, context=context)
             else:
-                value = empty_metric_value(target_metric)
+                metric_val = empty_metric_value(target_metric, context=context)
+
+            metric_res: MetricResult | None = (
+                metric_val if isinstance(metric_val, MetricResult) else None
+            )
+            raw_value = metric_res.value if metric_res is not None else metric_val
+            res_n = metric_res.n if metric_res is not None else None
+            res_of = metric_res.of if metric_res is not None else None
+            res_reason = metric_res.reason if metric_res is not None else None
+            res_metadata = metric_res.metadata if metric_res is not None else None
 
             # convert the value to a float (either by expanding the dict or array)
             # or by casting to a float
             group = registry_unqualified_name(target_metric)
-            if isinstance(value, Mapping):
-                for key, val in value.items():
+            if isinstance(raw_value, Mapping):
+                for key, val in raw_value.items():
+                    if isinstance(val, MetricResult):
+                        item_val = float(cast(Any, val.value))
+                        item_n = val.n if val.n is not None else res_n
+                        item_of = val.of if val.of is not None else res_of
+                        item_reason = (
+                            val.reason if val.reason is not None else res_reason
+                        )
+                        item_metadata = (
+                            val.metadata if val.metadata is not None else res_metadata
+                        )
+                    else:
+                        item_val = float(cast(Any, val))
+                        item_n = res_n
+                        item_of = res_of
+                        item_reason = res_reason
+                        item_metadata = res_metadata
                     result_metrics[f"{metric_name}_{key}"] = EvalMetric(
                         name=key,
                         group=group,
-                        value=cast(float, val),
+                        value=item_val,
                         params=metric_params,
+                        metadata=item_metadata,
+                        n=item_n,
+                        of=item_of,
+                        reason=item_reason,
                     )
-            elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
-                for idx, item in enumerate(value):
+            elif isinstance(raw_value, Sequence) and not isinstance(
+                raw_value, str | bytes
+            ):
+                for idx, item in enumerate(raw_value):
+                    if isinstance(item, MetricResult):
+                        item_val = float(cast(Any, item.value))
+                        item_n = item.n if item.n is not None else res_n
+                        item_of = item.of if item.of is not None else res_of
+                        item_reason = (
+                            item.reason if item.reason is not None else res_reason
+                        )
+                        item_metadata = (
+                            item.metadata if item.metadata is not None else res_metadata
+                        )
+                    else:
+                        item_val = float(cast(Any, item))
+                        item_n = res_n
+                        item_of = res_of
+                        item_reason = res_reason
+                        item_metadata = res_metadata
                     result_metrics[f"{metric_name}_{idx}"] = EvalMetric(
                         name=str(idx),
                         group=group,
-                        value=cast(float, item),
+                        value=item_val,
                         params=metric_params,
+                        metadata=item_metadata,
+                        n=item_n,
+                        of=item_of,
+                        reason=item_reason,
                     )
             else:
                 result_metrics[metric_name] = EvalMetric(
-                    name=metric_name, value=cast(float, value), params=metric_params
+                    name=metric_name,
+                    value=float(cast(Any, raw_value)),
+                    params=metric_params,
+                    metadata=res_metadata,
+                    n=res_n,
+                    of=res_of,
+                    reason=res_reason,
                 )
 
         # create a scorer result for this metric
@@ -598,21 +742,45 @@ def scorers_from_metric_dict(
     return results
 
 
-def call_metric(metric: Metric, sample_scores: list[SampleScore]) -> Value:
-    if is_metric_deprecated(metric):
-        warn_once(
-            logger,
-            f"Metric {registry_log_name(metric)} should be updated to take list[SampleScore]. "
-            f"Metrics with list[Score] are deprecated.",
-        )
-        scores = [sample_score.score for sample_score in sample_scores]
-        return metric(scores)
-    else:
-        metric = cast(MetricProtocol, metric)
-        return metric(sample_scores)
+def call_metric(
+    metric: Metric,
+    sample_scores: list[SampleScore],
+    context: MetricContext | None = None,
+) -> Value | MetricResult:
+    token = _CURRENT_METRIC_CONTEXT.set(context)
+    try:
+        if is_metric_deprecated(metric):
+            warn_once(
+                logger,
+                f"Metric {registry_log_name(metric)} should be updated to take list[SampleScore]. "
+                f"Metrics with list[Score] are deprecated.",
+            )
+            scores = [sample_score.score for sample_score in sample_scores]
+            return metric(scores)
+        else:
+            metric = cast(MetricProtocol, metric)
+            try:
+                sig = inspect.signature(metric)
+                if "context" in sig.parameters:
+                    return metric(sample_scores, context=context)  # type: ignore[call-arg]
+                elif len(sig.parameters) >= 2:
+                    params = list(sig.parameters.values())
+                    if params[1].kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.POSITIONAL_ONLY,
+                    ):
+                        return metric(sample_scores, context)  # type: ignore[call-arg]
+            except (ValueError, TypeError):
+                pass
+            return metric(sample_scores)
+    finally:
+        _CURRENT_METRIC_CONTEXT.reset(token)
 
 
-def empty_metric_value(metric: Metric) -> Value:
+def empty_metric_value(
+    metric: Metric,
+    context: MetricContext | None = None,
+) -> Value | MetricResult:
     """Value for a metric over zero scored samples (#5150).
 
     The metric gets its own empty case first: a shaped metric (e.g. grouped)
@@ -622,7 +790,7 @@ def empty_metric_value(metric: Metric) -> Value:
     the metric row stays visible the way it was on main.
     """
     try:
-        empty_value = call_metric(metric, [])
+        empty_value = call_metric(metric, [], context=context)
     except Exception as e:
         warn_once(
             logger,
@@ -630,6 +798,8 @@ def empty_metric_value(metric: Metric) -> Value:
             f"reporting NaN instead. ({type(e).__name__})",
         )
         return float("Nan")
+    if isinstance(empty_value, MetricResult):
+        return empty_value
     if isinstance(empty_value, Mapping) and len(empty_value) > 0:
         return empty_value
     return float("Nan")

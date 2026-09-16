@@ -166,7 +166,15 @@ def task_scores(scores: list[EvalScore], pad_edge: bool = False) -> list[Table]:
             # Add score name and metrics
             table.add_row(f"[bold]{score.name}[/bold]")
             for name, metric in score.metrics.items():
-                table.add_row(f"{name}", f"{metric.value:.3f}")
+                if math.isnan(metric.value) and metric.reason:
+                    val_str = f"nan ({metric.reason})"
+                elif metric.n is not None and metric.of is not None:
+                    val_str = f"{metric.value:.3f} [{metric.n}/{metric.of}]"
+                elif metric.n is not None:
+                    val_str = f"{metric.value:.3f} [n={metric.n}]"
+                else:
+                    val_str = f"{metric.value:.3f}"
+                table.add_row(f"{name}", val_str)
 
             score_tables.append(table)
 
