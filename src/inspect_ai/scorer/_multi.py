@@ -35,11 +35,12 @@ def multi_scorer(scorers: list[Scorer], reducer: str | ScoreReducer) -> Scorer:
         scores = await tg_collect(
             [functools.partial(_scorer, state, target) for _scorer in scorers]
         )
-        # Filter out None values from scores list
-        resolved_scores = [score for score in scores if score is not None]
+        # Map declining sub-scorers (None) to Score.unscored to preserve panel cardinality
+        resolved_scores = [
+            score if score is not None else Score.unscored(reason="scoring_failed")
+            for score in scores
+        ]
         if len(resolved_scores) == 0:
-            # every sub-scorer declined to score; reducers index scores[0]
-            # so surface the unscored sentinel rather than crashing
             return Score.unscored(reason="scoring_failed")
         return reducer(resolved_scores)
 

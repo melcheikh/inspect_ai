@@ -171,7 +171,7 @@ def test_multi_scorer_can_wrap_model_graded_scorers() -> None:
 
 def test_multi_scorer_all_none_returns_unscored() -> None:
     # Regression: when every sub-scorer returns None (which the Scorer
-    # protocol permits), multi_scorer filtered to an empty list and the
+    # protocol permits), multi_scorer previously filtered to an empty list and the
     # reducer crashed with IndexError on scores[0]. It should instead
     # yield the unscored NaN sentinel.
     async def none_scorer(state: TaskState, target: Target) -> None:
@@ -189,3 +189,55 @@ def test_multi_scorer_all_none_returns_unscored() -> None:
     assert isinstance(result, Score)
     assert isinstance(result.value, float) and math.isnan(result.value)
     assert result.reason == "scoring_failed"
+
+
+def test_multi_scorer_none_preserves_panel_cardinality_and_prevents_false_majority() -> (
+    None
+):
+    # Issue #5154: When a sub-scorer returns None, it must not be silently discarded.
+    # Discarding None reduces panel cardinality and creates false majorities.
+    # In a panel of 3 where only 1 votes "C" and 2 decline (None), "C" must NOT win.
+    async def score_c(state: TaskState, target: Target) -> Score:
+        return Score(value="C", answer="c")
+
+    async def score_none(state: TaskState, target: Target) -> None:
+        return None
+
+    state = TaskState(
+        model=ModelName("mockllm/model"),
+        sample_id=0,
+        epoch=0,
+        input=[],
+        messages=[],
+    )
+
+    # 1 of 3 judges voted "C", 2 returned None: no majority, must be unscored (NaN)
+    panel_3 = multi_scorer([score_c, score_none, score_none], reducer="majority")
+    result_3 = anyio.run(panel_3, state, Target(""))
+
+    assert isinstance(result_3, Score)
+    assert isinstance(result_3.value, float) and math.isnan(result_3.value)
+    assert result_3.metadata is not None
+    panel_meta = result_3.metadata.get("panel")
+    assert panel_meta is not None
+    assert panel_meta["size"] == 3
+    assert panel_meta["votes"] == ["C", None, None]
+    assert len(panel_meta["failures"]) == 2
+    assert panel_meta["failures"][0]["index"] == 1
+    assert panel_meta["failures"][0]["reason"] == "scoring_failed"
+    assert panel_meta["failures"][1]["index"] == 2
+    assert panel_meta["failures"][1]["reason"] == "scoring_failed"
+
+    # 2 of 3 judges voted "C", 1 returned None: strict majority holds (2 > 3/2)
+    panel_majority = multi_scorer([score_c, score_c, score_none], reducer="majority")
+    result_majority = anyio.run(panel_majority, state, Target(""))
+
+    assert isinstance(result_majority, Score)
+    assert result_majority.value == "C"
+    assert result_majority.metadata is not None
+    panel_meta_maj = result_majority.metadata.get("panel")
+    assert panel_meta_maj is not None
+    assert panel_meta_maj["size"] == 3
+    assert panel_meta_maj["votes"] == ["C", "C", None]
+    assert len(panel_meta_maj["failures"]) == 1
+    assert panel_meta_maj["failures"][0]["index"] == 2
